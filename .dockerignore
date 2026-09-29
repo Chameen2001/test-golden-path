@@ -1,0 +1,7 @@
+.git
+.github
+.idea
+target
+k8s
+deploy
+*.md
