@@ -1,0 +1,142 @@
+# Push to main: test, build a container, push it to Amazon ECR, and roll it out on EKS.
+#
+# One-time GitHub repository settings:
+#   Secret  AWS_ROLE_ARN       IAM role ARN that GitHub Actions assumes via OIDC
+#   Variable AWS_REGION        Cluster region, for example ap-southeast-2
+#   Variable ECR_REPOSITORY    ECR repository name, for example test-golden-path
+#   Variable EKS_CLUSTER_NAME  EKS cluster name
+#
+# IAM role trust policy:  deploy/aws/github-oidc-trust-policy.json
+# IAM role permissions:   deploy/aws/github-actions-permissions.json
+# The role also needs an EKS access entry that can apply Deployments and Services.
+# Keep the namespace below in sync with k8s/kustomization.yaml.
+
+name: Deploy to EKS
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+          cache: maven
+
+      - name: Test
+        run: ./mvnw -B verify
+
+  deploy:
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      actions: write
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY }}
+      EKS_CLUSTER_NAME: ${{ vars.EKS_CLUSTER_NAME }}
+      AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+      NAMESPACE: test-golden-path
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Require deploy settings
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in AWS_REGION ECR_REPOSITORY EKS_CLUSTER_NAME AWS_ROLE_ARN; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Set ${name} in GitHub repository secrets or variables."
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Ensure ECR repository
+        run: |
+          set -euo pipefail
+          if ! aws ecr describe-repositories --repository-names "$ECR_REPOSITORY" --region "$AWS_REGION" >/dev/null 2>&1; then
+            aws ecr create-repository \
+              --repository-name "$ECR_REPOSITORY" \
+              --region "$AWS_REGION" \
+              --image-scanning-configuration scanOnPush=true
+          fi
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+
+      - name: Configure EKS kubeconfig
+        run: aws eks update-kubeconfig --name "$EKS_CLUSTER_NAME" --region "$AWS_REGION"
+
+      - name: Deploy to EKS
+        env:
+          IMAGE: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+        run: |
+          set -euo pipefail
+          kubectl create namespace "$NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+          kubectl kustomize k8s | sed "s|image: test-golden-path:latest|image: ${IMAGE}|" | kubectl apply -f -
+          kubectl -n "$NAMESPACE" rollout status deployment/test-golden-path --timeout=300s
+
+      - name: Print application URL
+        run: |
+          set -euo pipefail
+          hostname=""
+          for _ in $(seq 1 30); do
+            hostname="$(kubectl -n "$NAMESPACE" get svc test-golden-path -o jsonpath='{.status.loadBalancer.ingress[0].hostname}{.status.loadBalancer.ingress[0].ip}')"
+            if [ -n "$hostname" ]; then
+              break
+            fi
+            sleep 10
+          done
+          {
+            echo "## Deployed to EKS"
+            echo "Image: \`${{ steps.login-ecr.outputs.registry }}/${ECR_REPOSITORY}:${GITHUB_SHA}\`"
+            if [ -n "$hostname" ]; then
+              echo "URL: http://${hostname}/goldenPath"
+            else
+              echo "The deployment is up. The load balancer hostname is not assigned yet."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          kubectl -n "$NAMESPACE" get svc test-golden-path

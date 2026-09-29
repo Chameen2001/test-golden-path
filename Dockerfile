@@ -1,11 +1,21 @@
+FROM eclipse-temurin:25 AS build
+
+WORKDIR /src
+
+COPY .mvn .mvn
+COPY mvnw pom.xml ./
+COPY src src
+
+RUN chmod +x mvnw && ./mvnw -B -DskipTests package
+
 FROM eclipse-temurin:25
 
-# Setup application workspace
-RUN mkdir /opt/app
 WORKDIR /opt/app
 
-# Copy the pre-built executable jar
-COPY target/test_golden_path-0.0.1-SNAPSHOT.jar /opt/app/japp.jar
+COPY --from=build --chown=1000:1000 /src/target/test_golden_path-*.jar /opt/app/japp.jar
 
-# Run the application
+USER 1000
+
+EXPOSE 8081
+
 CMD ["java", "-jar", "/opt/app/japp.jar"]
